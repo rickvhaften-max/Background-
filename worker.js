@@ -126,7 +126,7 @@ export default {
     let i; try {i = JSON.parse(body);} catch {return json({error: 'Invalid payload'}, 400);}
     if (i.type === 1) return json({type: 1}); // Discord PING
     if (i.type !== 2 || i.data?.name !== 'bgcheck') return json({type: 4, data: {flags: EPHEMERAL, content: 'Unknown command'}});
-    if (!isStaff(i, env)) return json({type: 4, data: {flags: EPHEMERAL, content: '⛔ Staff only: no permission to run a background check.'}});
+    
     const username = String(i.data?.options?.find(v => v.name === 'username')?.value || '').trim();
     if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return json({type: 4, data: {flags: EPHEMERAL, content: 'Please enter an exact valid Roblox username.'}});
     ctx.waitUntil(backgroundCheck(i, username));
