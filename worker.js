@@ -1,137 +1,163 @@
-// LLTE Roblox Background Check Discord command (Cloudflare Workers Free).
-// The Worker receives Discord slash command interactions; no persistent bot process is needed.
+
+// LLTE Roblox Background Check — Cloudflare Workers Free
+// Public Discord slash command, public results, cached Roblox API calls.
 const DAPI = 'https://discord.com/api/v10';
-const EPHEMERAL = 64;
-const escapeText = (v, max = 100) => String(v ?? 'Unknown').replaceAll('@', '@\u200b').replace(/[`*_~|<>]/g, '').replace(/[\r\n]/g, ' ').slice(0, max);
-function json(data, status = 200) { return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json;charset=UTF-8', 'cache-control': 'no-store' }}); }
-function unhex(hex) {
-  if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) throw new Error('Invalid signature/key');
-  return new Uint8Array(hex.match(/../g).map(v => parseInt(v, 16)));
+const CACHE_TTL = 300;
+const TIMEOUT_MS = 7000;
+const enc = new TextEncoder();
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {status, headers: {'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store'}});
 }
-async function verifyDiscord(request, rawBody, env) {
-  const signature = request.headers.get('X-Signature-Ed25519') || '';
-  const timestamp = request.headers.get('X-Signature-Timestamp') || '';
-  if (!/^[a-f0-9]{128}$/i.test(signature) || !/^[a-f0-9]{64}$/i.test(env.DISCORD_PUBLIC_KEY || '') || !/^\d+$/.test(timestamp) || Math.abs(Date.now() - Number(timestamp) * 1000) > 5 * 60 * 1000) return false;
+function clean(value, max = 100) {
+  return String(value ?? 'Unknown').replace(/@/g, '@\u200b').replace(/[`*_~|<>\\]/g, '').replace(/[\r\n]/g, ' ').slice(0, max);
+}
+function unhex(hex) {
+  if (!/^(?:[a-f0-9]{2})+$/i.test(hex)) throw Error('Invalid hex');
+  return Uint8Array.from(hex.match(/../g), x => parseInt(x, 16));
+}
+async function verifyDiscord(request, raw, env) {
+  const sig = request.headers.get('X-Signature-Ed25519') || '';
+  const time = request.headers.get('X-Signature-Timestamp') || '';
+  if (!/^[a-f0-9]{128}$/i.test(sig) || !/^[a-f0-9]{64}$/i.test(env.DISCORD_PUBLIC_KEY || '') || !/^\d+$/.test(time)) return false;
+  if (Math.abs(Date.now() - Number(time) * 1000) > 300000) return false;
   try {
     const key = await crypto.subtle.importKey('raw', unhex(env.DISCORD_PUBLIC_KEY), {name: 'Ed25519'}, false, ['verify']);
-    return await crypto.subtle.verify('Ed25519', key, unhex(signature), new TextEncoder().encode(timestamp + rawBody));
+    return await crypto.subtle.verify('Ed25519', key, unhex(sig), enc.encode(time + raw));
   } catch { return false; }
 }
-function isStaff(interaction, env) {
-  if (!interaction.guild_id || (env.DISCORD_GUILD_ID && interaction.guild_id !== env.DISCORD_GUILD_ID) || !interaction.member) return false;
-  let p = 0n;
-  try { p = BigInt(interaction.member.permissions || 0); } catch { /* leave */ }
-  const hasPerm = (p & ((1n << 3n) | (1n << 5n))) !== 0n; // Administrator / Manage Server
-  const allowedRoles = (env.STAFF_ROLE_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-  return hasPerm || allowedRoles.some(role => (interaction.member.roles || []).includes(role));
+function cacheKey(url, payload) {
+  const encoded = payload ? encodeURIComponent(JSON.stringify(payload)) : '';
+  return new Request('https://llte-cache.invalid/' + encodeURIComponent(url) + (encoded ? '?body=' + encoded : ''));
 }
-async function roblox(url, payload) {
+async function roblox(url, payload, ttl = CACHE_TTL) {
+  const key = cacheKey(url, payload);
+  const cache = caches.default;
+  const cached = await cache.match(key);
+  if (cached) return cached.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(url, {
+      method: payload ? 'POST' : 'GET',
+      headers: {'accept': 'application/json', ...(payload ? {'content-type': 'application/json'} : {})},
+      body: payload ? JSON.stringify(payload) : undefined,
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e?.name === 'AbortError') throw Error('Roblox is taking too long. Please try again.');
+    throw Error('Roblox is temporarily unreachable.');
+  } finally { clearTimeout(timer); }
+  if (response.status === 429) throw Error('Roblox is rate limiting requests. Please try again in a few minutes.');
+  if (!response.ok) throw Error(`Roblox API error (HTTP ${response.status}).`);
+  const data = await response.json();
+  // Cache only successful responses. The Workers cache is per data center.
+  if (ttl > 0) {
+    await cache.put(key, new Response(JSON.stringify(data), {
+      headers: {'content-type': 'application/json', 'cache-control': `public, max-age=${ttl}`},
+    }));
+  }
+  return data;
+}
+async function editOriginal(interaction, embed) {
+  const url = `${DAPI}/webhooks/${encodeURIComponent(interaction.application_id)}/${encodeURIComponent(interaction.token)}/messages/@original`;
   const response = await fetch(url, {
-    method: payload ? 'POST' : 'GET',
-    headers: payload ? {'content-type': 'application/json', 'accept': 'application/json'} : {'accept': 'application/json'},
-    body: payload ? JSON.stringify(payload) : undefined,
+    method: 'PATCH', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({embeds: [embed], allowed_mentions: {parse: []}}),
   });
-  if (response.status === 429) throw Error('Roblox rate limited this check; retry later.');
-  if (!response.ok) throw Error(`Roblox API returned HTTP ${response.status}`);
-  return response.json();
+  if (!response.ok) console.error('Discord edit failed', response.status, (await response.text()).slice(0, 300));
 }
-async function sendFollowup(i, embed) {
-  const url = `${DAPI}/webhooks/${encodeURIComponent(i.application_id)}/${encodeURIComponent(i.token)}`;
-  const r = await fetch(url, {
-    method: 'POST', headers: {'content-type': 'application/json'},
-    body: JSON.stringify({flags: EPHEMERAL, allowed_mentions: {parse: []}, embeds: [embed]}),
-  });
-  if (!r.ok) console.error('Discord follow-up error:', r.status);
+function field(name, value, inline = false) {
+  return {name, value: String(value || 'Unavailable').slice(0, 1024), inline};
 }
-const textField = (name, value, inline = false) => ({name, value: String(value).slice(0, 1024) || 'Unavailable', inline});
-function failure(message) {return {title: '🔎 LLTE | Roblox Background Check', color: 0xD08041, description: escapeText(message, 500)};}
+function failure(message) {
+  return {title: 'LLTE | Roblox Background Check', description: clean(message, 500), color: 0xD08041};
+}
+async function optional(url, ttl) {
+  try {return await roblox(url, null, ttl);} catch (e) {console.log('Optional Roblox request unavailable:', url, String(e)); return null;}
+}
 async function backgroundCheck(interaction, username) {
   try {
-    const lookup = await roblox('https://users.roblox.com/v1/usernames/users', {usernames: [username], excludeBannedUsers: false});
+    const lookup = await roblox('https://users.roblox.com/v1/usernames/users', {usernames: [username], excludeBannedUsers: false}, 600);
     const entry = lookup?.data?.[0];
-    if (!entry?.id) return sendFollowup(interaction, failure(`Roblox account not found: ${username}`));
+    if (!entry?.id) return editOriginal(interaction, failure(`Roblox account not found: ${username}`));
     const id = Number(entry.id);
-    if (!Number.isSafeInteger(id) || id < 1) throw Error('Invalid Roblox ID');
-    const result = await Promise.allSettled([
-      roblox(`https://users.roblox.com/v1/users/${id}`),
-      roblox(`https://users.roblox.com/v1/users/${id}/username-history?limit=10&sortOrder=Desc`),
-      roblox(`https://groups.roblox.com/v1/users/${id}/groups/roles`),
-      roblox(`https://friends.roblox.com/v1/users/${id}/friends/count`),
-      roblox(`https://friends.roblox.com/v1/users/${id}/followers/count`),
-      roblox(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${id}&size=150x150&format=Png&isCircular=false`),
+    if (!Number.isSafeInteger(id) || id < 1) throw Error('Invalid Roblox account ID.');
+    // Only one essential profile request; optional requests are isolated.
+    const profile = await roblox(`https://users.roblox.com/v1/users/${id}`, null, 300);
+    const [groups, friends, thumbnail] = await Promise.all([
+      optional(`https://groups.roblox.com/v1/users/${id}/groups/roles`, 600),
+      optional(`https://friends.roblox.com/v1/users/${id}/friends/count`, 300),
+      optional(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${id}&size=150x150&format=Png&isCircular=false`, 900),
     ]);
-    const data = result.map(x => x.status === 'fulfilled' ? x.value : null);
-    const [profile, history, groups, friends, followers, thumbnail] = data;
     const created = profile?.created ? new Date(profile.created) : null;
-    const createdValid = created && !isNaN(created.getTime());
-    const ageDays = createdValid ? Math.max(0, Math.floor((Date.now() - created.getTime()) / 86400000)) : null;
-    const dateText = createdValid ? `${ageDays} days (<t:${Math.floor(created.getTime()/1000)}:D>)` : 'Unavailable';
-    const pastNames = Array.isArray(history?.data) ? (history.data.length ? history.data.map(x => escapeText(x.name, 35)).join(', ') : 'None returned') : 'Unavailable';
+    const validCreated = created && !Number.isNaN(created.getTime());
+    const ageDays = validCreated ? Math.max(0, Math.floor((Date.now() - created.getTime()) / 86400000)) : null;
     const fields = [
-      textField('Name', escapeText(profile?.name || entry.name, 70)),
-      textField('ID', String(id), true),
-      textField('Profile URL', `[Open Roblox Profile](https://www.roblox.com/users/${id}/profile)`),
-      textField('Past Names', pastNames),
-      textField('Premium', 'Not publicly verified'),
-      textField('Verified LLTE', 'Not linked — Roblox ownership must be verified separately'),
-      textField('Statistics', `• Friends: ${typeof friends?.count === 'number' ? friends.count : 'Unavailable'}\n• Followers: ${typeof followers?.count === 'number' ? followers.count : 'Unavailable'}\n• Age: ${dateText}`),
-      textField('Game Banned', 'Not checked — requires LLTE game records'),
-      textField('Community Banned', 'Not checked — requires LLTE staff records'),
-      textField('Blacklists', 'Not checked — no shared blacklist connected'),
-      textField('Status', 'Public profile check complete; staff review required'),
+      field('Username', clean(profile?.name || entry.name, 70), true),
+      field('Display name', clean(profile?.displayName || entry.displayName, 70), true),
+      field('Roblox ID', String(id), true),
+      field('Account age', validCreated ? `${ageDays} days (<t:${Math.floor(created.getTime() / 1000)}:D>)` : 'Unavailable', true),
+      field('Friends', typeof friends?.count === 'number' ? String(friends.count) : 'Unavailable', true),
+      field('Roblox banned', typeof profile?.isBanned === 'boolean' ? (profile.isBanned ? 'Yes (Roblox profile flag)' : 'No (Roblox profile flag)') : 'Unavailable', true),
+      field('LLTE account verification', 'Not checked — account ownership not verified'),
+      field('LLTE bans / blacklists', 'Not checked — no LLTE moderation records connected'),
     ];
     if (Array.isArray(groups?.data)) {
-      const items = groups.data.slice(0, 18).map(a => `• ${escapeText(a.group?.name, 38)} — ${escapeText(a.role?.name, 32)}`);
-      let block = '';
-      let page = 1;
-      for (const item of items) {
-        if (block && block.length + item.length + 1 > 850) {fields.push(textField(`Public Groups (${page++})`, block)); block = '';}
-        block += (block ? '\n' : '') + item;
-      }
-      fields.push(textField('Public Groups' + (page > 1 ? ` (${page})` : ''), block || 'None returned'));
-      if (groups.data.length > 18) fields.push(textField('Additional Groups', `${groups.data.length - 18} more not shown`));
-    } else fields.push(textField('Public Groups', 'Unavailable from Roblox API'));
+      const list = groups.data.slice(0, 12).map(x => `• ${clean(x.group?.name, 42)} — ${clean(x.role?.name, 30)}`);
+      const value = list.join('\n').slice(0, 950) || 'No public groups returned';
+      fields.push(field('Public groups', value));
+      if (groups.data.length > 12) fields.push(field('Other groups', `${groups.data.length - 12} additional groups not shown`));
+    } else fields.push(field('Public groups', 'Unavailable'));
     const embed = {
-      title: `Background Check | ${escapeText(profile?.name || username, 45)}`,
+      title: `LLTE Background Check | ${clean(profile?.name || username, 45)}`,
       url: `https://www.roblox.com/users/${id}/profile`,
-      description: '🛡️ LLTE Imperial Command · Automatic public Roblox information',
-      color: 0x477CB5,
-      fields: fields.slice(0, 25), timestamp: new Date().toISOString(),
-      footer: {text: 'Staff only • This does not prove account ownership or determine trustworthiness'},
+      description: 'Public Roblox account information • Not proof of identity or trustworthiness',
+      color: 0x477CB5, fields: fields.slice(0, 25), timestamp: new Date().toISOString(),
+      footer: {text: 'LLTE • Public check • Roblox may temporarily limit API requests'},
     };
     const img = thumbnail?.data?.[0]?.imageUrl;
     if (typeof img === 'string' && img.startsWith('https://')) embed.thumbnail = {url: img};
-    await sendFollowup(interaction, embed);
-  } catch (e) { console.error('Background check failure:', String(e)); await sendFollowup(interaction, failure(e?.message || 'Background check unavailable')); }
+    await editOriginal(interaction, embed);
+  } catch (e) {
+    console.error('Background check failed', String(e));
+    await editOriginal(interaction, failure(e?.message || 'Background check unavailable.'));
+  }
 }
 async function registerSlashCommand(env) {
-  if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_GUILD_ID || !env.DISCORD_BOT_TOKEN) return json({error: 'Set DISCORD_APPLICATION_ID, DISCORD_GUILD_ID and DISCORD_BOT_TOKEN first.'}, 400);
-  const cmd = {name: 'bgcheck', description: 'Automatically check public Roblox account information (LLTE staff only)', type: 1,
-    options: [{name: 'username', description: 'Exact Roblox username (not display name)', type: 3, required: true, min_length: 3, max_length: 20}], dm_permission: false};
-  const response = await fetch(`${DAPI}/applications/${env.DISCORD_APPLICATION_ID}/guilds/${env.DISCORD_GUILD_ID}/commands`, {method: 'POST', headers: {'authorization': `Bot ${env.DISCORD_BOT_TOKEN}`, 'content-type': 'application/json'}, body: JSON.stringify(cmd)});
-  if (!response.ok) return json({error: 'Registration failed; check application ID, guild ID, bot invite and token', discordStatus: response.status}, 400);
-  return json({registered: true, command: '/bgcheck username', message: 'You can now remove DISCORD_BOT_TOKEN and SETUP_KEY from Worker secrets if you will not register again.'});
+  if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_GUILD_ID || !env.DISCORD_BOT_TOKEN) return json({error: 'Missing DISCORD_APPLICATION_ID, DISCORD_GUILD_ID or DISCORD_BOT_TOKEN'}, 400);
+  const cmd = {
+    name: 'bgcheck', type: 1,
+    description: 'Check public Roblox account information (available to everyone)',
+    options: [{name: 'username', description: 'Exact Roblox username (not display name)', type: 3, required: true, min_length: 3, max_length: 20}],
+  };
+  // POST updates an existing guild command with the same name.
+  const response = await fetch(`${DAPI}/applications/${env.DISCORD_APPLICATION_ID}/guilds/${env.DISCORD_GUILD_ID}/commands`, {
+    method: 'POST', headers: {'authorization': `Bot ${env.DISCORD_BOT_TOKEN}`, 'content-type': 'application/json'}, body: JSON.stringify(cmd),
+  });
+  if (!response.ok) return json({error: 'Discord registration failed', discordStatus: response.status}, 400);
+  return json({registered: true, command: '/bgcheck username', visibility: 'public', permission: 'everyone'});
 }
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === '/health' && request.method === 'GET') return json({service: 'LLTE Roblox Background Check', status: 'ready', command: '/bgcheck', needsManualRestart: false});
+    if ((url.pathname === '/' || url.pathname === '/health') && request.method === 'GET') return json({service: 'LLTE Roblox Background Check', status: 'ready', command: '/bgcheck', publicResults: true});
     if (url.pathname === '/register' && request.method === 'GET') {
       if (!env.SETUP_KEY || url.searchParams.get('key') !== env.SETUP_KEY) return json({error: 'Not authorized'}, 403);
       return registerSlashCommand(env);
     }
     if (url.pathname !== '/interactions' || request.method !== 'POST') return json({error: 'Not found'}, 404);
-    const body = await request.text();
-    if (!await verifyDiscord(request, body, env)) return json({error: 'Invalid Discord signature'}, 401);
-    let i; try {i = JSON.parse(body);} catch {return json({error: 'Invalid payload'}, 400);}
-    if (i.type === 1) return json({type: 1}); // Discord PING
-    if (i.type !== 2 || i.data?.name !== 'bgcheck') return json({type: 4, data: {flags: EPHEMERAL, content: 'Unknown command'}});
-    
-    const username = String(i.data?.options?.find(v => v.name === 'username')?.value || '').trim();
-    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return json({type: 4, data: {flags: EPHEMERAL, content: 'Please enter an exact valid Roblox username.'}});
-    ctx.waitUntil(backgroundCheck(i, username));
-    return json({type: 5, data: {flags: EPHEMERAL}}); // deferred, private to requesting staff member
+    const raw = await request.text();
+    if (!await verifyDiscord(request, raw, env)) return json({error: 'Invalid Discord signature'}, 401);
+    let interaction;
+    try {interaction = JSON.parse(raw);} catch {return json({error: 'Invalid JSON'}, 400);}
+    if (interaction.type === 1) return json({type: 1});
+    if (interaction.type !== 2 || interaction.data?.name !== 'bgcheck') return json({type: 4, data: {content: 'Unknown command'}});
+    if (env.DISCORD_GUILD_ID && interaction.guild_id !== env.DISCORD_GUILD_ID) return json({type: 4, data: {content: 'This command is only available in the LLTE server.', flags: 64}});
+    const username = String(interaction.data?.options?.find(x => x.name === 'username')?.value || '').trim();
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) return json({type: 4, data: {content: 'Enter a valid Roblox username.', flags: 64}});
+    ctx.waitUntil(backgroundCheck(interaction, username));
+    return json({type: 5}); // Public deferred response; PATCH @original when finished.
   },
 };
-// LLTE deploy test
-
