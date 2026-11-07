@@ -1,3 +1,8 @@
+
 name = "llte-background-check"
 main = "worker.js"
 compatibility_date = "2026-11-07"
+
+[vars]
+DISCORD_APPLICATION_ID = "VUL_HIER_JE_APPLICATION_ID_IN"
+DISCORD_GUILD_ID = "VUL_HIER_JE_SERVER_ID_IN"
