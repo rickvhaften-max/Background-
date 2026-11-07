@@ -6,6 +6,7 @@ compatibility_date = "2026-11-07"
 [vars]
 DISCORD_APPLICATION_ID = "1568649520101851320"
 DISCORD_GUILD_ID = "1567584260695654535"
+DISCORD_PUBLIC_KEY = "e07d75c4617a3beea56bcee35cc8b77ffd6b9f5929c39b70c2c1da794c8a1fe6"
 
 [observability.logs]
 enabled = true
